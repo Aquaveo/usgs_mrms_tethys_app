@@ -1,15 +1,64 @@
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 from pathlib import Path
 from time import perf_counter
+from typing import Callable, Optional
 
 from .flood_alert_s3 import download_flood_alert_inputs
-from .flood_alert_utils import build_run_directory, build_run_id
+from .flood_alert_storage import BASIN_GEOJSON, storage
+from .flood_alert_utils import build_run_directory, build_run_id, get_times_from_run_id
 
 from mrms_usgs_events.ews.state_rain import build_current_state_rain_npz
 from mrms_usgs_events.ews.current_alerts import compute_current_alerts_for_state
 from mrms_usgs_events.ews.tethys_outputs import export_basin_alerts_geojson
+
+
+def flood_alert_workdir() -> Path:
+    """Per-replica local scratch dir for compute + reference-data caching.
+
+    Intermediates (downloaded reference npz, current-rain arrays) live here on
+    local disk; only the final run outputs are published to shared storage.
+    """
+    root = Path(os.getenv("USGS_MRMS_WORKDIR", str(Path(tempfile.gettempdir()) / "usgs_mrms_work")))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def run_flood_alert_job(job: dict, progress: Callable[[str], None]) -> str:
+    """JobManager runner: compute the run, publish outputs to shared storage.
+
+    Returns the storage prefix of the published run (the job's ``result_key``).
+    """
+    state = job["state"].upper()
+    run_id = job["run_id"]
+    params = job.get("params") or {}
+    start, end = get_times_from_run_id(run_id)
+    workers = int(params.get("workers", 4))
+
+    result = run_flood_alert_pipeline(
+        base_dir=flood_alert_workdir(),
+        state=state,
+        start=start,
+        end=end,
+        workers=workers,
+        progress=progress,
+    )
+
+    progress("Publishing results…")
+    run_dir = Path(result["run_dir"])
+    for fname in (BASIN_GEOJSON, "basin_alerts.csv", "pixel_alerts.csv"):
+        fp = run_dir / fname
+        if fp.exists():
+            storage.publish(fp, state, run_id, fname)
+    # pixel parquet drives the on-demand pixel GeoJSON endpoint
+    pixel_parquet = Path(result["exports"]["pixel_alerts_parquet"])
+    if pixel_parquet.exists():
+        storage.publish(pixel_parquet, state, run_id, "pixel_alerts.parquet")
+
+    return storage.run_prefix(state, run_id)
 
 
 def run_flood_alert_pipeline(
@@ -19,9 +68,15 @@ def run_flood_alert_pipeline(
     start: str,
     end: str,
     workers: int = 4,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> dict:
     state = state.upper()
     base_dir = Path(base_dir)
+
+    def _report(msg: str) -> None:
+        print(msg, flush=True)
+        if progress is not None:
+            progress(msg)
 
     run_id = build_run_id(start, end)
     run_dir = build_run_directory(base_dir, state, start, end)
@@ -39,6 +94,7 @@ def run_flood_alert_pipeline(
 
     total_t0 = perf_counter()
 
+    _report("Downloading reference data…")
     t0 = perf_counter()
     inputs = download_flood_alert_inputs(
         base_dir=base_dir,
@@ -47,6 +103,7 @@ def run_flood_alert_pipeline(
     )
     print(f"[TIME] download inputs: {perf_counter() - t0:.2f} sec", flush=True)
 
+    _report("Building current rainfall…")
     t1 = perf_counter()
     current_rain_npz = base_dir / "current_rain" / f"{state}_{run_id}_current_rain.npz"
 
@@ -61,6 +118,7 @@ def run_flood_alert_pipeline(
     )
     print(f"[TIME] build current rain: {perf_counter() - t1:.2f} sec", flush=True)
 
+    _report("Computing flood alerts…")
     t2 = perf_counter()
 
     efficient_event_reference_fp = (
@@ -85,6 +143,7 @@ def run_flood_alert_pipeline(
 
     print(f"[TIME] compute alerts: {perf_counter() - t2:.2f} sec", flush=True)
 
+    _report("Exporting basin alerts…")
     t3 = perf_counter()
 
     alerts_dir = base_dir / "ews_alerts" / state
