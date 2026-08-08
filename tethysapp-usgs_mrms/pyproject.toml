@@ -56,5 +56,6 @@ include = ["*"]
     "templates/**/*",
     "public/**/*",
     "resources/**/*",
-    "workspaces/**/*"
+    "workspaces/**/*",
+    "state_map_extents/**/*"
 ]

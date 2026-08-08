@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pandas as pd
 from django.http import JsonResponse
 from tethys_sdk.routing import controller
 
 from ..app import App
-from ..flood_alert_service import run_flood_alert_pipeline
-from ..flood_alert_utils import build_run_id, get_times_from_run_id
+from ..flood_alert_service import run_flood_alert_job
+from ..flood_alert_storage import BASIN_GEOJSON, storage
+from ..flood_alert_utils import build_run_id
+from ..jobs import get_job_manager
 
 
 STATES = [
@@ -144,98 +145,72 @@ def _pixel_polygon_from_center(lon: float, lat: float, dx: float = 0.01, dy: flo
 def flood_alert(request):
     return App.render(request, "flood_alert.html", {"states": STATES})
 
-@controller(name="do_run_flood_alert", url="do_run_flood_alert", app_media=True)
-def do_run_flood_alert(request, app_media):
-    state = request.POST.get("state", "").upper().strip()
-    start_dt, end_dt = get_times_from_run_id(request.POST.get("run_id", ""))
-    workers = int(request.POST.get("workers", "4"))
+@controller(name="run_flood_alert", url="flood-alert/run/")
+def run_flood_alert(request):
+    """Submit a flood-alert run as a background job (dedup + status in the DB).
 
-    base_dir = Path(app_media.path)
-    run_dir = base_dir / "flood_alert_runs" / state / request.POST.get("run_id", "")
-
-    lock_fp = run_dir / ".running.lock"
-    done_fp = run_dir / ".done"
-    try:
-        run_dir.mkdir(parents=True, exist_ok=True)
-        lock_fp.write_text("running\n", encoding="utf-8")
-        
-        run_flood_alert_pipeline(
-            base_dir=base_dir,
-            state=state,
-            start=start_dt,
-            end=end_dt,
-            workers=workers,
-        )
-
-        done_fp.write_text("done\n", encoding="utf-8")
-
-        return JsonResponse({"status": "success"})
-    
-
-    except Exception as e:
-        return JsonResponse({"status": "error", "message": str(e)})
-
-    finally:
-        try:
-            lock_fp.unlink(missing_ok=True)
-        except Exception:
-            return JsonResponse({"status": "error", "message": f"Failed to remove lock file: {lock_fp}"}, status=500)
-
-
-@controller(name="run_flood_alert", url="flood-alert/run/", app_media=True)
-def run_flood_alert(request, app_media):
+    Renders the processing page, which polls ``flood-alert/status/<job_id>`` and
+    redirects to the results once the job succeeds. Reuses a completed run whose
+    outputs already exist in shared storage.
+    """
     if request.method != "POST":
         return App.render(request, "flood_alert.html", {"states": STATES})
 
     state = request.POST.get("state", "").upper().strip()
     if request.POST.get("run_id"):
-        start_dt, end_dt = get_times_from_run_id(request.POST.get("run_id", ""))
+        run_id = request.POST["run_id"]
     else:
         start_dt = _normalize_datetime_from_form(request.POST.get("start_datetime", ""))
         end_dt = _normalize_datetime_from_form(request.POST.get("end_datetime", ""))
+        run_id = build_run_id(start_dt, end_dt)
     workers = int(request.POST.get("workers", "4"))
 
-    base_dir = Path(app_media.path)
-    run_id = build_run_id(start_dt, end_dt)
-    run_dir = base_dir / "flood_alert_runs" / state / run_id
-
-    lock_fp = run_dir / ".running.lock"
-    done_fp = run_dir / ".done"
-
-    if lock_fp.exists():
-        context = {
-            "status": "error",
-            "error_message": (
-                f"This Flood Alert run is already running: {state} / {run_id}. "
-                "Please wait until it finishes instead of submitting it again."
-            ),
-            "state": state,
-            "start_datetime": start_dt,
-            "end_datetime": end_dt,
-            "workers": workers,
-        }
-        return App.render(request, "flood_alert_run_status.html", context)
-
-    if done_fp.exists() and (run_dir / "basin_alerts.geojson").exists():
-        context = {
-            "status": "success",
-            "state": state,
-            "run_id": run_id,
-            "run_dir": str(run_dir),
-            "basin_geojson": str(run_dir / "basin_alerts.geojson"),
-            "pixel_alerts_parquet": str(base_dir / "ews_alerts" / state / "pixel_alerts.parquet"),
-            "message": "This run already exists. Reusing previous outputs.",
-        }
-        return App.render(request, "flood_alert_run_status.html", context)
-    
-    context = {
-        "state": state, 
-        "run_id": run_id, 
-        "workers": workers, 
-        "process_type": "flood_alert", 
-        "message": "Generating flood alert results..."
+    base_context = {
+        "state": state.lower(),
+        "run_id": run_id,
+        "workers": workers,
+        "process_type": "flood_alert",
     }
-    return App.render(request, "processing.html", context)
+
+    # A finished run is already in shared storage -> any replica can serve it.
+    if storage.run_exists(state, run_id):
+        return App.render(request, "processing.html", {
+            **base_context,
+            "job_status": "success",
+            "message": "This run already exists. Loading results…",
+        })
+
+    job, created = get_job_manager().submit(
+        state=state,
+        run_id=run_id,
+        key=f"{state}:{run_id}",
+        params={"workers": workers},
+        runner=run_flood_alert_job,
+    )
+
+    return App.render(request, "processing.html", {
+        **base_context,
+        "job_id": job["id"],
+        "message": "Generating flood alert results…",
+    })
+
+
+@controller(name="flood_alert_status", url="flood-alert/status/{job_id}/")
+def flood_alert_status(request, job_id):
+    """Current state of one background flood-alert job (polled by the UI)."""
+    job = get_job_manager().get(job_id)
+    if job is None:
+        return JsonResponse({"status": "error", "message": "No such job"}, status=404)
+    return JsonResponse({
+        "status": "success",
+        "job": {
+            "job_id": job["id"],
+            "state": job["state"],
+            "run_id": job["run_id"],
+            "job_status": job["status"],
+            "message": job["message"],
+        },
+    })
     
         
 
@@ -243,44 +218,29 @@ def run_flood_alert(request, app_media):
 @controller(
     name="flood_alert_results",
     url="flood-alert/results/{state}/{run_id}/",
-    app_media=True,
 )
-def flood_alert_results(request, state, run_id, app_media):
-    base_dir = Path(app_media.path)
+def flood_alert_results(request, state, run_id):
     state = state.upper()
-
-    run_dir = base_dir / "flood_alert_runs" / state / run_id
-    basin_geojson = run_dir / "basin_alerts.geojson"
-    pixel_parquet = base_dir / "ews_alerts" / state / "pixel_alerts.parquet"
-
     context = {
         "state": state,
         "run_id": run_id,
-        "run_dir": str(run_dir),
-        "basin_geojson_exists": basin_geojson.exists(),
-        "pixel_parquet_exists": pixel_parquet.exists(),
-        "basin_geojson_path": str(basin_geojson),
-        "pixel_parquet_path": str(pixel_parquet),
+        "basin_geojson_exists": storage.run_exists(state, run_id),
+        "pixel_parquet_exists": storage.exists(state, run_id, "pixel_alerts.parquet"),
     }
-
     return App.render(request, "flood_alert_results.html", context)
 
 
 @controller(
     name="flood_alert_basin_geojson",
-    url="flood-alert/geojson/{state}/{run_id}/basins/",
-    app_media=True)
-def flood_alert_basin_geojson(request, state, run_id, app_media):
-    base_dir = Path(app_media.path)
+    url="flood-alert/geojson/{state}/{run_id}/basins/")
+def flood_alert_basin_geojson(request, state, run_id):
     state = state.upper()
 
-    fp = base_dir / "flood_alert_runs" / state / run_id / "basin_alerts.geojson"
-
-    if not fp.exists():
-        return JsonResponse({"error": f"Missing basin GeoJSON: {fp}"}, status=404)
-
-    with open(fp, "r", encoding="utf-8") as f:
-        obj = json.load(f)
+    with storage.local(state, run_id, BASIN_GEOJSON) as fp:
+        if fp is None:
+            return JsonResponse({"error": "Missing basin GeoJSON"}, status=404)
+        with open(fp, "r", encoding="utf-8") as f:
+            obj = json.load(f)
 
     relevant_levels = {"WARNING", "SEVERE"}
 
@@ -315,10 +275,8 @@ def flood_alert_basin_geojson(request, state, run_id, app_media):
 @controller(
     name="flood_alert_pixel_geojson",
     url="flood-alert/geojson/{state}/{run_id}/pixels/",
-    app_media=True,
 )
-def flood_alert_pixel_geojson(request, state, run_id, app_media):
-    base_dir = Path(app_media.path)
+def flood_alert_pixel_geojson(request, state, run_id):
     state = state.upper()
 
     site_id = request.GET.get("site_id")
@@ -327,12 +285,10 @@ def flood_alert_pixel_geojson(request, state, run_id, app_media):
     if not site_id:
         return JsonResponse({"error": "Missing required query parameter: site_id"}, status=400)
 
-    parquet_fp = base_dir / "ews_alerts" / state / "pixel_alerts.parquet"
-
-    if not parquet_fp.exists():
-        return JsonResponse({"error": f"Missing pixel alerts parquet: {parquet_fp}"}, status=404)
-
-    df = pd.read_parquet(parquet_fp)
+    with storage.local(state, run_id, "pixel_alerts.parquet") as parquet_fp:
+        if parquet_fp is None:
+            return JsonResponse({"error": "Missing pixel alerts parquet"}, status=404)
+        df = pd.read_parquet(parquet_fp)
 
     if df.empty:
         return JsonResponse(
@@ -425,7 +381,7 @@ def flood_alert_pixel_geojson(request, state, run_id, app_media):
                 "state": state,
                 "site_id": site_id,
                 "n_features": len(features),
-                "source": str(parquet_fp),
+                "source": storage.key_for(state, run_id, "pixel_alerts.parquet"),
                 "dynamic_from_parquet": True,
                 "max_pixels": max_pixels,
             },

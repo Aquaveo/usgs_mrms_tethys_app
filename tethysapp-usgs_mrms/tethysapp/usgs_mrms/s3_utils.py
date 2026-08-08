@@ -1,25 +1,10 @@
-import boto3
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "../../.env"))
+from .s3_config import full_key, get_bucket
 
-BUCKET_NAME = "usgs-mrms-explorer"
 MAX_WORKERS = 4
-
-
-def get_bucket():
-    key = os.getenv("KEY")
-    secret = os.getenv("SECRET")
-    s3 = boto3.resource(
-        "s3",
-        aws_access_key_id=key,
-        aws_secret_access_key=secret,
-        region_name="us-east-1",
-    )
-    return s3.Bucket(BUCKET_NAME)
 
 
 def _download_one_file(obj_key, local_path):
@@ -41,7 +26,7 @@ def _download_files_parallel(download_jobs, max_workers=MAX_WORKERS):
 
 def download_basin_geojson_files(state_name, destination_path):
     bucket = get_bucket()
-    prefix = f"basins_json/{state_name}"
+    prefix = full_key(f"basins_json/{state_name}")
     dest = f"{destination_path}/basin_json_downloaded_files"
     state_dest = f"{dest}/{state_name}"
 
@@ -85,7 +70,9 @@ def download_zarr_file(state_name, gage_id, destination_path):
     second_folder = gage_id[:4]
     bucket = get_bucket()
 
-    zarr_prefix = f"rain_zarr/{state_name}/{first_folder}/{second_folder}/{gage_id}.zarr"
+    zarr_prefix = full_key(
+        f"rain_zarr/{state_name}/{first_folder}/{second_folder}/{gage_id}.zarr"
+    )
 
     dest = f"{destination_path}/zarr_files"
     local_zarr_path = os.path.join(dest, f"{gage_id}.zarr")

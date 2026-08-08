@@ -4,29 +4,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import boto3
-from dotenv import load_dotenv
-
-
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
-
-BUCKET_NAME = "usgs-mrms-explorer"
-
-
-def get_bucket():
-    key = os.getenv("KEY")
-    secret = os.getenv("SECRET")
-
-    if not key or not secret:
-        raise RuntimeError("Missing S3 credentials. Expected KEY and SECRET in the app .env file.")
-
-    s3 = boto3.resource(
-        "s3",
-        aws_access_key_id=key,
-        aws_secret_access_key=secret,
-        region_name="us-east-1",
-    )
-    return s3.Bucket(BUCKET_NAME)
+from .s3_config import bucket_name, full_key, get_bucket
 
 
 def download_s3_file_if_missing(*, s3_key: str, local_fp: Path) -> Path:
@@ -38,8 +16,9 @@ def download_s3_file_if_missing(*, s3_key: str, local_fp: Path) -> Path:
         return local_fp
 
     bucket = get_bucket()
-    print(f"[DOWNLOAD] s3://{BUCKET_NAME}/{s3_key} -> {local_fp}", flush=True)
-    bucket.download_file(s3_key, str(local_fp))
+    key = full_key(s3_key)
+    print(f"[DOWNLOAD] s3://{bucket_name()}/{key} -> {local_fp}", flush=True)
+    bucket.download_file(key, str(local_fp))
     return local_fp
 
 
@@ -60,15 +39,22 @@ def download_s3_prefix_jsons(
     s3_prefix: str,
     local_dir: Path,
     workers: int = 4,
+    only_stems: set[str] | None = None,
 ) -> list[Path]:
+    # only_stems limits the download to objects whose filename stem is in the set
+    # (e.g. just the alerted basins), instead of the whole prefix.
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
 
     bucket = get_bucket()
-    objects = [obj for obj in bucket.objects.filter(Prefix=s3_prefix) if obj.key.endswith(".json")]
+    prefix = full_key(s3_prefix)
+    objects = [obj for obj in bucket.objects.filter(Prefix=prefix) if obj.key.endswith(".json")]
 
-    if not objects:
-        raise FileNotFoundError(f"No JSON files found in s3://{BUCKET_NAME}/{s3_prefix}")
+    if only_stems is not None:
+        want = {str(s) for s in only_stems}
+        objects = [obj for obj in objects if Path(obj.key).stem in want]
+    elif not objects:
+        raise FileNotFoundError(f"No JSON files found in s3://{bucket_name()}/{prefix}")
 
     tasks = []
     downloaded: list[Path] = []
@@ -82,7 +68,7 @@ def download_s3_prefix_jsons(
             tasks.append((obj.key, local_fp))
 
     print(
-        f"[BASIN JSON] prefix=s3://{BUCKET_NAME}/{s3_prefix} "
+        f"[BASIN JSON] prefix=s3://{bucket_name()}/{prefix} "
         f"total={len(objects)} existing={len(downloaded)} to_download={len(tasks)} workers={workers}",
         flush=True,
     )
@@ -108,7 +94,7 @@ def download_s3_prefix_jsons(
                     print(f"[BASIN JSON] downloaded {n}/{len(tasks)}", flush=True)
 
             except Exception as e:
-                raise RuntimeError(f"Failed downloading s3://{BUCKET_NAME}/{obj_key} -> {local_fp}: {e}") from e
+                raise RuntimeError(f"Failed downloading s3://{bucket_name()}/{obj_key} -> {local_fp}: {e}") from e
 
     return downloaded
 
@@ -147,12 +133,10 @@ def download_flood_alert_inputs(
         local_fp=base_dir / "hydro_history" / "state_efficient_event_reference" / f"{state}_efficient_event_reference.npz",
     )
 
+    # Basin geometries are fetched on demand for only the alerted basins (see
+    # flood_alert_service) rather than bulk-downloaded here — a run uses a handful,
+    # but the full set is hundreds of files / hundreds of MiB.
     basin_json_dir = base_dir / "basins_json" / state
-    download_s3_prefix_jsons(
-        s3_prefix=f"basins_json/{state}/",
-        local_dir=basin_json_dir,
-        workers=workers,
-    )
 
     return {
         "state_mask_fp": state_mask_fp,
