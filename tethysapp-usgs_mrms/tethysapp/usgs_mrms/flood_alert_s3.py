@@ -39,7 +39,10 @@ def download_s3_prefix_jsons(
     s3_prefix: str,
     local_dir: Path,
     workers: int = 4,
+    only_stems: set[str] | None = None,
 ) -> list[Path]:
+    # only_stems limits the download to objects whose filename stem is in the set
+    # (e.g. just the alerted basins), instead of the whole prefix.
     local_dir = Path(local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)
 
@@ -47,7 +50,10 @@ def download_s3_prefix_jsons(
     prefix = full_key(s3_prefix)
     objects = [obj for obj in bucket.objects.filter(Prefix=prefix) if obj.key.endswith(".json")]
 
-    if not objects:
+    if only_stems is not None:
+        want = {str(s) for s in only_stems}
+        objects = [obj for obj in objects if Path(obj.key).stem in want]
+    elif not objects:
         raise FileNotFoundError(f"No JSON files found in s3://{bucket_name()}/{prefix}")
 
     tasks = []
@@ -127,12 +133,10 @@ def download_flood_alert_inputs(
         local_fp=base_dir / "hydro_history" / "state_efficient_event_reference" / f"{state}_efficient_event_reference.npz",
     )
 
+    # Basin geometries are fetched on demand for only the alerted basins (see
+    # flood_alert_service) rather than bulk-downloaded here — a run uses a handful,
+    # but the full set is hundreds of files / hundreds of MiB.
     basin_json_dir = base_dir / "basins_json" / state
-    download_s3_prefix_jsons(
-        s3_prefix=f"basins_json/{state}/",
-        local_dir=basin_json_dir,
-        workers=workers,
-    )
 
     return {
         "state_mask_fp": state_mask_fp,

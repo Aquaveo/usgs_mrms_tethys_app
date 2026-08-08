@@ -7,7 +7,9 @@ from pathlib import Path
 from time import perf_counter
 from typing import Callable, Optional
 
-from .flood_alert_s3 import download_flood_alert_inputs
+import pandas as pd
+
+from .flood_alert_s3 import download_flood_alert_inputs, download_s3_prefix_jsons
 from .flood_alert_storage import BASIN_GEOJSON, storage
 from .flood_alert_utils import build_run_directory, build_run_id, get_times_from_run_id
 
@@ -154,13 +156,32 @@ def run_flood_alert_pipeline(
     basin_csv = run_dir / "basin_alerts.csv"
     pixel_csv = run_dir / "pixel_alerts.csv"
 
+    relevant_levels = ["SEVERE", "WARNING"]
+
+    # Fetch geometry for ONLY the alerted basins, not the whole state's hundreds.
+    # compute_current_alerts already wrote basin_alerts.parquet; the export below
+    # uses geometry solely for the SEVERE/WARNING rows.
+    basin_df = pd.read_parquet(basin_alerts_parquet)
+    if {"alert_level", "site_id"}.issubset(basin_df.columns):
+        alerted = set(
+            basin_df.loc[basin_df["alert_level"].isin(relevant_levels), "site_id"].astype(str)
+        )
+        if alerted:
+            _report(f"Fetching {len(alerted)} alerted basin geometries…")
+            download_s3_prefix_jsons(
+                s3_prefix=f"basins_json/{state}/",
+                local_dir=base_dir / "basins_json" / state,
+                workers=workers,
+                only_stems=alerted,
+            )
+
     export_basin_alerts_geojson(
-    state=state,
-    base_dir=base_dir,
-    basin_alerts_parquet=basin_alerts_parquet,
-    out_geojson=basin_geojson,
-    relevant_levels=["SEVERE", "WARNING"],
-    max_features=300,
+        state=state,
+        base_dir=base_dir,
+        basin_alerts_parquet=basin_alerts_parquet,
+        out_geojson=basin_geojson,
+        relevant_levels=relevant_levels,
+        max_features=300,
     )
 
     # Keep lightweight copies for the run folder.
